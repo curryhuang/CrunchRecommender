@@ -18,12 +18,16 @@
 package cn.edu.bjtu.cit.recommender;
 
 import java.io.Serializable;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.Comparator;
 import java.util.Iterator;
 import java.util.Map;
 import java.util.PriorityQueue;
 import java.util.Queue;
+import java.util.Stack;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
@@ -54,6 +58,7 @@ import cn.edu.bjtu.cit.recommender.profile.ProfileConverter;
 
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
+import com.sun.xml.internal.bind.v2.runtime.unmarshaller.XsiNilLoader.Array;
 
 @SuppressWarnings("serial")
 public class Top20CoBuyItems extends Configured implements Tool, Serializable {
@@ -231,8 +236,9 @@ public class Top20CoBuyItems extends Configured implements Tool, Serializable {
 							Iterator<Vector.Element> it2 = input.second().iterateNonZero();
 							while (it2.hasNext()) {
 								int index2 = it2.next().index();
-								if(index1 != index2){
-									emitter.emit(Pair.of(index1 < index2 ? index1 + "#" + index2 : index2 + "#" + index1, 1));
+								if(index1 < index2){
+									Pair<String, Integer> emitted = Pair.of(index1 + "#" + index2, 1);
+									emitter.emit(emitted);
 								}
 							}
 						}
@@ -276,43 +282,63 @@ public class Top20CoBuyItems extends Configured implements Tool, Serializable {
 		/*
 		 * S4
 		 */
-		PTable<Integer, Collection<Pair<String, Integer>>> groupedResult = labeledCount.groupByKey().parallelDo(
-				new DoFn<Pair<Integer, Iterable<Pair<String, Integer>>>, Pair<Integer, Collection<Pair<String, Integer>>>>() {
+		PTable<Integer, String> groupedResult = labeledCount.groupByKey().parallelDo(
+				new DoFn<Pair<Integer, Iterable<Pair<String, Integer>>>, Pair<Integer, String>>() {
 
-					Queue<Pair<String, Integer>> heap = new PriorityQueue<Pair<String, Integer>>(TWENTY, BY_PAIR_COUNT);
 					@Override
 					public void process(Pair<Integer, Iterable<Pair<String, Integer>>> input,
-							Emitter<Pair<Integer, Collection<Pair<String, Integer>>>> emitter) {
+							Emitter<Pair<Integer, String>> emitter) {
+						Queue<Pair<String, Integer>> heap = new PriorityQueue<Pair<String, Integer>>(TWENTY, new PairComparator());
 						for(Pair<String, Integer> pair : input.second()){
-							heap.add(pair);
+							if(heap.isEmpty() || heap.size() < THREE){
+								heap.add(pair);
+							}
+							else if(heap.size() > THREE && pair.second() > heap.peek().second()){
+								heap.remove();
+								heap.add(pair);
+							}
 						}
-						
-						Collection<Pair<String, Integer>> c = Lists.newArrayList();
+						StringBuffer sb = new StringBuffer();
 						for(Pair<String, Integer> p : heap){
-							c.add(p);
+							sb.append(p.toString() + ",");
 						}
-						emitter.emit(Pair.of(1, c));
+						sb.deleteCharAt(sb.length() - 1);
+						log.info(sb.toString());
+						emitter.emit(Pair.of(1, sb.toString()));
 					}
 				},
 				Writables.tableOf(Writables.ints(),
-						Writables.collections(Writables.pairs(Writables.strings(), Writables.ints()))));
+						Writables.strings()));
 		
 		/*
 		 * GBK + S5
 		 */
 		PTable<String, Integer> finalResult = groupedResult.groupByKey().parallelDo(
-						new DoFn<Pair<Integer, Iterable<Collection<Pair<String, Integer>>>>, Pair<String, Integer>>() {
-							Queue<Pair<String, Integer>> heap = new PriorityQueue<Pair<String, Integer>>(THREE, BY_PAIR_COUNT);
+						new DoFn<Pair<Integer, Iterable<String>>, Pair<String, Integer>>() {
+							Pattern pattern = Pattern.compile("(\\d+#\\d+),(\\d+)");
 							@Override
-							public void process(Pair<Integer, Iterable<Collection<Pair<String, Integer>>>> input,
+							public void process(Pair<Integer, Iterable<String>> input,
 									Emitter<Pair<String, Integer>> emitter) {
-								for(Collection<Pair<String, Integer>> c : input.second()){
-									for(Pair<String, Integer> pair : c){
-										heap.add(pair);
+								Queue<Pair<String, Integer>> heap = new PriorityQueue<Pair<String, Integer>>(TWENTY, new PairComparator());
+								for(String str : input.second()){
+									Matcher m = pattern.matcher(str);
+									while(m.find()){
+										Pair<String, Integer> pair = Pair.of(m.group(1), Integer.parseInt(m.group(2)));
+										if(heap.isEmpty() || heap.size() < THREE){
+											heap.add(pair);
+										}
+										else if(heap.size() == THREE && pair.second() > heap.peek().second()){
+											heap.remove();
+											heap.add(pair);
+										}
 									}
 								}
-								for(Pair<String, Integer> pair : heap){
-									emitter.emit(pair);
+								Stack<Pair<String, Integer>> stack = new Stack<Pair<String, Integer>>();
+								while(!heap.isEmpty()){
+									stack.push(heap.remove());
+								}
+								while(!stack.isEmpty()){
+									emitter.emit(stack.pop());
 								}
 							}
 						}, Writables.tableOf(Writables.strings(), Writables.ints()));
@@ -324,7 +350,7 @@ public class Top20CoBuyItems extends Configured implements Tool, Serializable {
 			profiler.cleanup(pipeline.getConfiguration());
 			return 0;
 		}
-		
+
 		/*
 		 * asText
 		 */
@@ -332,6 +358,30 @@ public class Top20CoBuyItems extends Configured implements Tool, Serializable {
 		PipelineResult result = pipeline.done();
 		return result.succeeded() ? 0 : 1;
 	}
+	
+	private static class PairComparator implements Comparator<Pair<String, Integer>>, Serializable {
+		
+		private int one;
+		
+		public PairComparator(boolean reversed){
+			one = reversed ? 1 : -1;
+		}
+		
+		public PairComparator(){
+			this(false);
+		}
+		
+		@Override
+		public int compare(Pair<String, Integer> o1, Pair<String, Integer> o2) {
+			if (o1.second() < o2.second()) {
+				return one;
+			} else if (o1.second() > o2.second()) {
+				return one * (-1);
+			} else {
+				return 0;
+			}
+		}
+	};
 	
 	public void printUsage(){
 		System.out.println("profiling: profiling=[profile filename] to enable profiling, otherwise disable");
