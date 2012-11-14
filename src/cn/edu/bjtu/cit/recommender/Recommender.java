@@ -26,7 +26,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.PriorityQueue;
 import java.util.Queue;
-import java.util.regex.Pattern;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
@@ -41,9 +40,7 @@ import org.apache.crunch.Pair;
 import org.apache.crunch.Pipeline;
 import org.apache.crunch.PipelineResult;
 import org.apache.crunch.impl.mr.MRPipeline;
-import org.apache.crunch.impl.mr.collect.UnionCollection;
 import org.apache.crunch.impl.mr.plan.ClusterOracle;
-import org.apache.crunch.impl.mr.plan.MapReduceOracle;
 import org.apache.crunch.profile.Profiler;
 import org.apache.crunch.types.writable.RecommendedItems;
 import org.apache.crunch.types.writable.VectorAndPrefs;
@@ -51,7 +48,6 @@ import org.apache.crunch.types.writable.VectorOrPref;
 import org.apache.crunch.types.writable.Writables;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.conf.Configured;
-import org.apache.hadoop.mapred.Task;
 import org.apache.hadoop.util.GenericOptionsParser;
 import org.apache.hadoop.util.Tool;
 import org.apache.hadoop.util.ToolRunner;
@@ -76,6 +72,8 @@ public class Recommender extends Configured implements Tool, Serializable {
 	public static final String CLUSTER_SIZE_SHORT = "cs";
 	public static final String ESTIMATION = "estimation";
 	public static final String ESTIMATION_SHORT = "est";
+	public static final int ACTIVE_THRESHOLD = 20;
+	public static final int TOP = 10;
 	
 	private final Log log = LogFactory.getLog(Recommender.class);
 	private static final Comparator<RecommendedItem> BY_PREFERENCE_VALUE = new Comparator<RecommendedItem>() {
@@ -131,7 +129,7 @@ public class Recommender extends Configured implements Tool, Serializable {
 		for(String arg : args){
 			if(arg.contains("=")){
 				String[] tokens = arg.split("=");
-				options.put(tokens[0], tokens[1]);
+				options.put(tokens[0].toLowerCase(), tokens[1]);
 			}
 		}
 	}
@@ -177,7 +175,7 @@ public class Recommender extends Configured implements Tool, Serializable {
 
 			@Override
 			public Pair<Long, Long> map(String input) {
-				String[] split = input.split("\\s+");
+				String[] split = input.split(Estimator.DELM);
 				long userID = Long.parseLong(split[0]);
 				long itemID = Long.parseLong(split[1]);
 				return Pair.of(userID, itemID);
@@ -194,6 +192,7 @@ public class Recommender extends Configured implements Tool, Serializable {
 			}
 		}, Writables.tableOf(Writables.longs(), Writables.longs())).groupByKey(est.getClusterSize());
 
+		
 		/*
 		 * S1
 		 */
@@ -218,13 +217,41 @@ public class Recommender extends Configured implements Tool, Serializable {
 						return est.getScaleFactor("S1").recsFactor;
 					}
 				}, Writables.tableOf(Writables.longs(), Writables.vectors()));
-
+		
 		userVector = profiler.profile("S0-S1", pipeline, userVector, ProfileConverter.long_vector(),
-				Writables.tableOf(Writables.longs(), Writables.vectors()));
+				Writables.tableOf(Writables.longs(), Writables.vectors()));	
+		
 		/*
-		 * S2 + GBK
+		 * S2
 		 */
-		PGroupedTable<Integer, Integer> coOccurencePairs = userVector.parallelDo(
+		PTable<Long, Vector> filteredUserVector = userVector.parallelDo(new DoFn<Pair<Long, Vector>, Pair<Long, Vector>>(){
+
+			@Override
+			public void process(Pair<Long, Vector> input, Emitter<Pair<Long, Vector>> emitter) {
+				if(input.second().getNumNondefaultElements() > ACTIVE_THRESHOLD){
+					emitter.emit(input);
+				}
+			}
+			
+			@Override
+			public float scaleFactor() {
+				return est.getScaleFactor("S2").sizeFactor;
+			}
+
+			@Override
+			public float scaleFactorByRecord() {
+				return est.getScaleFactor("S2").recsFactor;
+			}
+			
+		}, Writables.tableOf(Writables.longs(), Writables.vectors()));
+		
+		filteredUserVector = profiler.profile("S2", pipeline, filteredUserVector, ProfileConverter.long_vector(),
+				Writables.tableOf(Writables.longs(), Writables.vectors()));	
+		
+		/*
+		 * S3 + GBK
+		 */
+		PGroupedTable<Integer, Integer> coOccurencePairs = filteredUserVector.parallelDo(
 				new DoFn<Pair<Long, Vector>, Pair<Integer, Integer>>() {
 					@Override
 					public void process(Pair<Long, Vector> input, Emitter<Pair<Integer, Integer>> emitter) {
@@ -241,19 +268,19 @@ public class Recommender extends Configured implements Tool, Serializable {
 
 					@Override
 					public float scaleFactor() {
-						float size = est.getScaleFactor("S2").sizeFactor;
+						float size = est.getScaleFactor("S3").sizeFactor;
 						return size;
 					}
 
 					@Override
 					public float scaleFactorByRecord() {
-						float recs = est.getScaleFactor("S2").recsFactor;
+						float recs = est.getScaleFactor("S3").recsFactor;
 						return recs;
 					}
 				}, Writables.tableOf(Writables.ints(), Writables.ints())).groupByKey(est.getClusterSize());
 
 		/*
-		 * S3
+		 * S4
 		 */
 		PTable<Integer, Vector> coOccurenceVector = coOccurencePairs.parallelDo(
 				new MapFn<Pair<Integer, Iterable<Integer>>, Pair<Integer, Vector>>() {
@@ -268,20 +295,20 @@ public class Recommender extends Configured implements Tool, Serializable {
 
 					@Override
 					public float scaleFactor() {
-						return est.getScaleFactor("S3").sizeFactor;
+						return est.getScaleFactor("S4").sizeFactor;
 					}
 
 					@Override
 					public float scaleFactorByRecord() {
-						return est.getScaleFactor("S3").recsFactor;
+						return est.getScaleFactor("S4").recsFactor;
 					}
 				}, Writables.tableOf(Writables.ints(), Writables.vectors()));
 
-		coOccurenceVector = profiler.profile("S2-S3", pipeline, coOccurenceVector, ProfileConverter.int_vector(),
+		coOccurenceVector = profiler.profile("S3-S4", pipeline, coOccurenceVector, ProfileConverter.int_vector(),
 				Writables.tableOf(Writables.ints(), Writables.vectors()));
 
 		/*
-		 * S4 Wrapping co-occurrence columns
+		 * S5 Wrapping co-occurrence columns
 		 */
 		PTable<Integer, VectorOrPref> wrappedCooccurrence = coOccurenceVector.parallelDo(
 				new MapFn<Pair<Integer, Vector>, Pair<Integer, VectorOrPref>>() {
@@ -293,23 +320,23 @@ public class Recommender extends Configured implements Tool, Serializable {
 					
 					@Override
 					public float scaleFactor() {
-						return est.getScaleFactor("S4").sizeFactor;
+						return est.getScaleFactor("S5").sizeFactor;
 					}
 
 					@Override
 					public float scaleFactorByRecord() {
-						return est.getScaleFactor("S4").recsFactor;
+						return est.getScaleFactor("S5").recsFactor;
 					}
 
 				}, Writables.tableOf(Writables.ints(), VectorOrPref.vectorOrPrefs()));
 		
-		wrappedCooccurrence = profiler.profile("S4", pipeline, wrappedCooccurrence, ProfileConverter.int_vopv(),
+		wrappedCooccurrence = profiler.profile("S5", pipeline, wrappedCooccurrence, ProfileConverter.int_vopv(),
 				Writables.tableOf(Writables.ints(), VectorOrPref.vectorOrPrefs()));
 
 		/*
-		 * S5 Splitting user vectors
+		 * S6 Splitting user vectors
 		 */
-		PTable<Integer, VectorOrPref> userVectorSplit = userVector.parallelDo(
+		PTable<Integer, VectorOrPref> userVectorSplit = filteredUserVector.parallelDo(
 				new DoFn<Pair<Long, Vector>, Pair<Integer, VectorOrPref>>() {
 
 					@Override
@@ -327,22 +354,22 @@ public class Recommender extends Configured implements Tool, Serializable {
 					
 					@Override
 					public float scaleFactor() {
-						return est.getScaleFactor("S5").sizeFactor;
+						return est.getScaleFactor("S6").sizeFactor;
 					}
 
 					@Override
 					public float scaleFactorByRecord() {
-						return est.getScaleFactor("S5").recsFactor;
+						return est.getScaleFactor("S6").recsFactor;
 					}
 				}, Writables.tableOf(Writables.ints(), VectorOrPref.vectorOrPrefs()));
 		
-		userVectorSplit = profiler.profile("S5", pipeline, userVectorSplit, ProfileConverter.int_vopp(),
+		userVectorSplit = profiler.profile("S6", pipeline, userVectorSplit, ProfileConverter.int_vopp(),
 				Writables.tableOf(Writables.ints(), VectorOrPref.vectorOrPrefs()));
 
 		/*
-		 * S6 Combine VectorOrPrefs
+		 * S7 Combine VectorOrPrefs
 		 */
-		PTable<Integer, VectorAndPrefs> combinedVectorOrPref = wrappedCooccurrence.union(userVectorSplit).groupByKey().parallelDo(
+		PTable<Integer, VectorAndPrefs> combinedVectorOrPref = wrappedCooccurrence.union(userVectorSplit).groupByKey(est.getClusterSize()).parallelDo(
 				new DoFn<Pair<Integer, Iterable<VectorOrPref>>, Pair<Integer, VectorAndPrefs>>() {
 
 					@Override
@@ -369,19 +396,19 @@ public class Recommender extends Configured implements Tool, Serializable {
 
 					@Override
 					public float scaleFactor() {
-						return est.getScaleFactor("S6").sizeFactor;
+						return est.getScaleFactor("S7").sizeFactor;
 					}
 
 					@Override
 					public float scaleFactorByRecord() {
-						return est.getScaleFactor("S6").recsFactor;
+						return est.getScaleFactor("S7").recsFactor;
 					}
 				}, Writables.tableOf(Writables.ints(), VectorAndPrefs.vectorAndPrefs()));
 		
-		combinedVectorOrPref = profiler.profile("S4+S5-S6", pipeline, combinedVectorOrPref, ProfileConverter.int_vap(),
+		combinedVectorOrPref = profiler.profile("S5+S6-S7", pipeline, combinedVectorOrPref, ProfileConverter.int_vap(),
 				Writables.tableOf(Writables.ints(), VectorAndPrefs.vectorAndPrefs()));
 		/*
-		 * S7 Computing partial recommendation vectors
+		 * S8 Computing partial recommendation vectors
 		 */
 		PTable<Long, Vector> partialMultiply = combinedVectorOrPref.parallelDo(
 				new DoFn<Pair<Integer, VectorAndPrefs>, Pair<Long, Vector>>() {
@@ -402,15 +429,15 @@ public class Recommender extends Configured implements Tool, Serializable {
 					
 					@Override
 					public float scaleFactor() {
-						return est.getScaleFactor("S7").sizeFactor;
+						return est.getScaleFactor("S8").sizeFactor;
 					}
 
 					@Override
 					public float scaleFactorByRecord() {
-						return est.getScaleFactor("S7").recsFactor;
+						return est.getScaleFactor("S8").recsFactor;
 					}
 					
-				}, Writables.tableOf(Writables.longs(), Writables.vectors())).groupByKey().combineValues(new CombineFn<Long, Vector>(){
+				}, Writables.tableOf(Writables.longs(), Writables.vectors())).groupByKey(est.getClusterSize()).combineValues(new CombineFn<Long, Vector>(){
 
 					@Override
 					public void process(Pair<Long, Iterable<Vector>> input, Emitter<Pair<Long, Vector>> emitter) {
@@ -432,11 +459,11 @@ public class Recommender extends Configured implements Tool, Serializable {
 					}
 				});
 		
-		partialMultiply = profiler.profile("S7-combine", pipeline, partialMultiply, ProfileConverter.long_vector(),
+		partialMultiply = profiler.profile("S8-combine", pipeline, partialMultiply, ProfileConverter.long_vector(),
 				Writables.tableOf(Writables.longs(), Writables.vectors()));
 		
 		/*
-		 * S8 Producing recommendations from vectors
+		 * S9 Producing recommendations from vectors
 		 */
 		PTable<Long, RecommendedItems> recommendedItems = partialMultiply.parallelDo(
 				new DoFn<Pair<Long, Vector>, Pair<Long, RecommendedItems>>() {
@@ -450,7 +477,7 @@ public class Recommender extends Configured implements Tool, Serializable {
 							Vector.Element element = recommendationVectorIterator.next();
 							int index = element.index();
 							float value = (float) element.get();
-							if (topItems.size() < 10) {
+							if (topItems.size() < TOP) {
 								topItems.add(new GenericRecommendedItem(index, value));
 							} else if (value > topItems.peek().getValue()) {
 								topItems.add(new GenericRecommendedItem(index, value));
@@ -462,14 +489,24 @@ public class Recommender extends Configured implements Tool, Serializable {
 						Collections.sort(recommendations, BY_PREFERENCE_VALUE);
 						emitter.emit(Pair.of(input.first(), new RecommendedItems(recommendations)));
 					}
+					
+					@Override
+					public float scaleFactor() {
+						return est.getScaleFactor("S9").sizeFactor;
+					}
+
+					@Override
+					public float scaleFactorByRecord() {
+						return est.getScaleFactor("S9").recsFactor;
+					}
 
 				}, Writables.tableOf(Writables.longs(), RecommendedItems.recommendedItems()));
 		
-		recommendedItems = profiler.profile("S8", pipeline, recommendedItems, ProfileConverter.long_ri(),
+		recommendedItems = profiler.profile("S9", pipeline, recommendedItems, ProfileConverter.long_ri(),
 				Writables.tableOf(Writables.longs(), RecommendedItems.recommendedItems()));
 		
 		/*
-		 * asText
+		 * Profiling
 		 */
 		if(profiler.isProfiling()){
 			pipeline.done();
@@ -477,7 +514,9 @@ public class Recommender extends Configured implements Tool, Serializable {
 			profiler.cleanup(pipeline.getConfiguration());
 			return 0;
 		}
-		
+		/*
+		 * asText
+		 */
 		pipeline.writeTextFile(recommendedItems, args[1]);
 		PipelineResult result = pipeline.done();
 		return result.succeeded() ? 0 : 1;

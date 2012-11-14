@@ -1,22 +1,16 @@
 package cn.edu.bjtu.cit.recommender;
 
-import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.Serializable;
 import java.util.List;
 import java.util.Map;
 import java.util.regex.Pattern;
 
-import javax.xml.parsers.DocumentBuilder;
-import javax.xml.parsers.DocumentBuilderFactory;
-import javax.xml.parsers.ParserConfigurationException;
-
 import org.apache.commons.lang.builder.HashCodeBuilder;
 import org.jdom2.Document;
 import org.jdom2.Element;
 import org.jdom2.JDOMException;
 import org.jdom2.input.SAXBuilder;
-import org.xml.sax.SAXException;
 
 import com.google.common.collect.Maps;
 
@@ -27,18 +21,16 @@ public class Estimator implements Serializable{
 	public static final String SCALE_FACTORS = "scalefactors";
 	public static final String SIZE_FACTOR = "size";
 	public static final String RECS_FACTOR = "recs";
-	public static final String DELM = "del";
+	public static final String DELM = "::|,|\\s+";
 	
 	public static Estimator instance;
 	
 	private int clusterSize;
-	private String delimiter;
 	private Map<String, ScaleFactor> scaleFactors;
 	
 	
 	public Estimator(String path, int clusterSize){
 		this.clusterSize = clusterSize;
-		delimiter = "(::|,|\\s+)";
 		scaleFactors = Maps.newHashMap();
 		parseConfiguration(path);
 	}
@@ -74,10 +66,6 @@ public class Estimator implements Serializable{
 	
 	public int getClusterSize(){
 		return this.clusterSize;
-	}
-	
-	public String getDelimiter(){
-		return this.delimiter;
 	}
 	
 	public ScaleFactor getScaleFactor(String stage){
