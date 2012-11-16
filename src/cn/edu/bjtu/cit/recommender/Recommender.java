@@ -23,7 +23,6 @@ import java.util.Collections;
 import java.util.Comparator;
 import java.util.Iterator;
 import java.util.List;
-import java.util.Map;
 import java.util.PriorityQueue;
 import java.util.Queue;
 
@@ -57,23 +56,22 @@ import org.apache.mahout.cf.taste.recommender.RecommendedItem;
 import org.apache.mahout.math.RandomAccessSparseVector;
 import org.apache.mahout.math.Vector;
 
+import cn.edu.bjtu.cit.cli.OptionParser;
 import cn.edu.bjtu.cit.recommender.profile.ProfileConverter;
 
 import com.google.common.collect.Lists;
-import com.google.common.collect.Maps;
 import com.google.common.primitives.Floats;
 
 @SuppressWarnings("serial")
 public class Recommender extends Configured implements Tool, Serializable {
 
-	public static final String PROFILING = "profiling";
-	public static final String PROFILING_SHORT = "p";
-	public static final String CLUSTER_SIZE = "clustersize";
-	public static final String CLUSTER_SIZE_SHORT = "cs";
-	public static final String ESTIMATION = "estimation";
-	public static final String ESTIMATION_SHORT = "est";
-	public static final int ACTIVE_THRESHOLD = 20;
-	public static final int TOP = 10;
+	public static final String PROFILING = "p";
+	public static final String CLUSTER_SIZE = "cs";
+	public static final String ESTIMATION = "est";
+	public static final String OPT_REDUCE = "opt.reduce";
+	public static final String OPT_MSCR = "opt.mscr";
+	public static final String ACTIVE_THRESHOLD = "at";
+	public static final String TOP = "top";
 
 	private final Log log = LogFactory.getLog(Recommender.class);
 	private static final Comparator<RecommendedItem> BY_PREFERENCE_VALUE = new Comparator<RecommendedItem>() {
@@ -85,50 +83,15 @@ public class Recommender extends Configured implements Tool, Serializable {
 
 	private Profiler profiler;
 	private Estimator est;
-	private Map<String, String> options;
+	private String estFile;
 	private String profileFilePath;
 	private int clusterSize = 1;
-	private String estFile;
+	private int top = 10;
+	private int threshold = 20;
+
 
 	public Recommender() {
 		est = new Estimator();
-		options = Maps.newHashMap();
-	}
-
-	public boolean on() {
-		if (options.containsKey(PROFILING)) {
-			profileFilePath = options.get(PROFILING);
-		} else if (options.containsKey(PROFILING_SHORT)) {
-			profileFilePath = options.get(PROFILING_SHORT);
-		}
-		return profileFilePath != null;
-	}
-
-	public boolean hasSetClusterSize() {
-		if (options.containsKey(CLUSTER_SIZE)) {
-			clusterSize = Integer.parseInt(options.get(CLUSTER_SIZE));
-		} else if (options.containsKey(CLUSTER_SIZE_SHORT)) {
-			clusterSize = Integer.parseInt(options.get(CLUSTER_SIZE_SHORT));
-		}
-		return clusterSize != 1;
-	}
-
-	public boolean hasEstimationFile() {
-		if (options.containsKey(ESTIMATION)) {
-			estFile = options.get(ESTIMATION);
-		} else if (options.containsKey(ESTIMATION_SHORT)) {
-			estFile = options.get(ESTIMATION_SHORT);
-		}
-		return estFile != null;
-	}
-
-	public void getOptions(String[] args) {
-		for (String arg : args) {
-			if (arg.contains("=")) {
-				String[] tokens = arg.split("=");
-				options.put(tokens[0].toLowerCase(), tokens[1]);
-			}
-		}
 	}
 
 	@SuppressWarnings("unchecked")
@@ -143,17 +106,40 @@ public class Recommender extends Configured implements Tool, Serializable {
 
 			return 1;
 		}
-		getOptions(args);
+		OptionParser parser = new OptionParser(args);
 
 		Pipeline pipeline = new MRPipeline(Recommender.class, getConf());
-		if (hasSetClusterSize()) {
-			pipeline.getConfiguration().setInt(ClusterOracle.CLUSTER_SIZE, clusterSize);
+		
+		if (parser.hasOption(CLUSTER_SIZE)) {
+			pipeline.getConfiguration().setInt(ClusterOracle.CLUSTER_SIZE,
+					Integer.parseInt(parser.getOption(CLUSTER_SIZE).getValue()));
 		}
-		if (on()) {
+		
+		if (parser.hasOption(PROFILING)) {
 			pipeline.getConfiguration().setBoolean(Profiler.IS_PROFILE, true);
+			this.profileFilePath = parser.getOption(PROFILING).getValue();
+			
 		}
-		if (hasEstimationFile()) {
+		
+		if (parser.hasOption(ESTIMATION)) {
+			estFile = parser.getOption(ESTIMATION).getValue();
 			est = new Estimator(estFile, clusterSize);
+		}
+		
+		if(parser.hasOption(OPT_REDUCE)){
+			pipeline.getConfiguration().setBoolean(OPT_REDUCE, true);
+		}
+		
+		if(parser.hasOption(OPT_MSCR)){
+			pipeline.getConfiguration().setBoolean(OPT_MSCR, true);
+		}
+		
+		if(parser.hasOption(ACTIVE_THRESHOLD)){
+			threshold = Integer.parseInt(parser.getOption("at").getValue());
+		}
+		
+		if(parser.hasOption(TOP)){
+			top = Integer.parseInt(parser.getOption("top").getValue());
 		}
 
 		profiler = new Profiler(pipeline);
@@ -226,7 +212,7 @@ public class Recommender extends Configured implements Tool, Serializable {
 
 					@Override
 					public void process(Pair<Long, Vector> input, Emitter<Pair<Long, Vector>> emitter) {
-						if (input.second().getNumNondefaultElements() > ACTIVE_THRESHOLD) {
+						if (input.second().getNumNondefaultElements() > threshold) {
 							emitter.emit(input);
 						}
 					}
@@ -477,7 +463,7 @@ public class Recommender extends Configured implements Tool, Serializable {
 							Vector.Element element = recommendationVectorIterator.next();
 							int index = element.index();
 							float value = (float) element.get();
-							if (topItems.size() < TOP) {
+							if (topItems.size() < top) {
 								topItems.add(new GenericRecommendedItem(index, value));
 							} else if (value > topItems.peek().getValue()) {
 								topItems.add(new GenericRecommendedItem(index, value));
@@ -509,7 +495,6 @@ public class Recommender extends Configured implements Tool, Serializable {
 		 * Profiling
 		 */
 		if (profiler.isProfiling()) {
-			pipeline.done();
 			profiler.writeResultToFile(profileFilePath);
 			profiler.cleanup(pipeline.getConfiguration());
 			return 0;
